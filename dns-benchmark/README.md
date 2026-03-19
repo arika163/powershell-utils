@@ -33,4 +33,3 @@ powershell -ExecutionPolicy Bypass -File .\dns-benchmark.ps1
 - 网络状况会影响测试结果，建议在稳定网络环境下重复测试以获得更可靠的排序。
 - 对于无法解析或超时的查询，脚本会将该次耗时视为较大值（脚本中为 `9999` ms），从而影响平均值。
 
-如果你想让脚本支持命令行参数（例如传入测试域或并发数），我可以帮你修改脚本以支持 `-Domain` / `-Parallel` 参数并更新 README 示例。
