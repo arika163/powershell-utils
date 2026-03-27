@@ -1,80 +1,85 @@
-# 1. 初始化 UDP Client 并启用端口复用 (避免与系统自带 DHCP 客户端冲突)
+# 1. 获取网卡
+$itfs = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { 
+    $_.InterfaceAlias -notmatch "Loopback|vEthernet|Pseudo|Virtual" -and $_.IPv4Address -ne "127.0.0.1" 
+}
+
+if (-not $itfs) { Write-Host "No IPv4 Interface found."; return }
+
+Write-Host "--- Network Interfaces ---"
+for ($i = 0; $i -lt $itfs.Count; $i++) {
+    Write-Host ("[" + $i + "] " + $itfs[$i].InterfaceAlias + " - " + $itfs[$i].IPv4Address)
+}
+
+$choice = Read-Host "Select Index (Default 0)"
+if ([string]::IsNullOrWhiteSpace($choice)) { $choice = "0" }
+$ip = $itfs[[int]$choice].IPv4Address
+
+# 2. 初始化 Socket
 $client = New-Object System.Net.Sockets.UdpClient
 $client.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
 $client.EnableBroadcast = $true
 
-# 绑定到正确的 DHCP 客户端端口 68
-$localEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 68)
-$client.Client.Bind($localEP)
+try {
+    $localEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($ip), 68)
+    $client.Client.Bind($localEP)
+} catch {
+    Write-Host "Bind failed. Please run as Administrator!" -ForegroundColor Red
+    return
+}
 
-# 2. 生成 Transaction ID
-$transactionId = [uint32](Get-Random)
-$b1 = ($transactionId -shr 24) -band 0xFF
-$b2 = ($transactionId -shr 16) -band 0xFF
-$b3 = ($transactionId -shr 8)  -band 0xFF
-$b4 = $transactionId -band 0xFF
+# 3. 构造 DHCP 报文 (避开切片赋值坑)
+$buf = New-Object byte[] 244
+$xid = [BitConverter]::GetBytes([uint32](Get-Random))
+if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($xid) }
 
-# 3. 构造 DHCP Discover 报文 (增加到 244 字节以容纳 Options)
-$buffer = New-Object byte[] 244
+# 基础头部
+$buf[0] = 0x01 # BootRequest
+$buf[1] = 0x01 # Ethernet
+$buf[2] = 0x06 # MAC Len
+[Array]::Copy($xid, 0, $buf, 4, 4) # Transaction ID
+$buf[10] = 0x80 # Broadcast Flag
 
-# BOOTP Header (0-27)
-$buffer[0] = 0x01 # Message Type: BootRequest
-$buffer[1] = 0x01 # Hardware Type: Ethernet
-$buffer[2] = 0x06 # Hardware Address Length: 6
-$buffer[3] = 0x00 # Hops
-$buffer[4] = $b1; $buffer[5] = $b2; $buffer[6] = $b3; $buffer[7] = $b4 # Transaction ID
+# 填充 MAC 地址 (手动赋值避免类型转换错误)
+$mac = [byte[]](0x00, 0x15, 0x5D, 0xAA, 0xBB, 0xCC)
+for($i=0; $i -lt 6; $i++) { $buf[28 + $i] = $mac[$i] }
 
-# CHADDR (Client Hardware Address, 偏移量 28-33) - 填入一个伪造的 MAC 地址
-$buffer[28] = 0x00; $buffer[29] = 0x11; $buffer[30] = 0x22
-$buffer[31] = 0x33; $buffer[32] = 0x44; $buffer[33] = 0x55
+# Magic Cookie
+$cookie = [byte[]](0x63, 0x82, 0x53, 0x63)
+for($i=0; $i -lt 4; $i++) { $buf[236 + $i] = $cookie[$i] }
 
-# Magic Cookie (偏移量 236-239)
-$buffer[236] = 0x63; $buffer[237] = 0x82; $buffer[238] = 0x53; $buffer[239] = 0x63
+# Option 53: DHCP Discover (53, 1, 1)
+$buf[240] = 53
+$buf[241] = 1
+$buf[242] = 1
 
-# Option 53: DHCP Message Type (偏移量 240-242)
-$buffer[240] = 53   # Option Code: 53
-$buffer[241] = 1    # Length: 1
-$buffer[242] = 1    # Value: 1 (Discover)
+# End Option
+$buf[243] = 255
 
-# Option 255: End (偏移量 243)
-$buffer[243] = 255  # 0xFF
+# 4. 发送并监听
+$rem = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Broadcast, 67)
+$client.Send($buf, $buf.Length, $rem) | Out-Null
 
-# 4. 发送广播包到 DHCP 服务器端口 67
-$remoteEP = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Broadcast, 67)
-$client.Send($buffer, $buffer.Length, $remoteEP) | Out-Null
-
-Write-Host "DHCP Discover sent, waiting for response..."
-
-# 5. 监听与接收
 $client.Client.ReceiveTimeout = 5000
-$servers = @{}
+$srvs = @{}
+
+Write-Host ("Scanning on " + $ip + "...") -ForegroundColor Yellow
 
 try {
     while ($true) {
-        $remote = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
-        $response = $client.Receive([ref]$remote)
-        
-        $ip = $remote.Address.ToString()
-
-        if (-not $servers.ContainsKey($ip)) {
-            $servers[$ip] = $true
-            Write-Host "DHCP Server found: $ip"
-            # 进阶：可以在这里解析 $response 字节数组来提取 DHCP Offer 的详情
+        $ref = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+        $raw = $client.Receive([ref]$ref)
+        $sIP = $ref.Address.ToString()
+        if (-not $srvs.ContainsKey($sIP)) {
+            $srvs[$sIP] = $true
+            Write-Host "Found DHCP Server: $sIP" -ForegroundColor Green
         }
     }
-}
-catch [System.Net.Sockets.SocketException] {
-    # 只捕获 SocketException，避免掩盖其他意外的语法错误
-    Write-Host "Receiving finished (timeout)"
-}
-finally {
-    # 确保释放 Socket 资源
-    if ($client) {
-        $client.Close()
-        $client.Dispose()
-    }
+} catch {
+    # Timeout
+} finally {
+    $client.Close()
+    $client.Dispose()
 }
 
-Write-Host "`n==============================="
-Write-Host "Total DHCP Servers found: $($servers.Count)"
-Write-Host "==============================="
+Write-Host "--- Done ---"
+Write-Host ("Total Servers Found: " + $srvs.Count)
